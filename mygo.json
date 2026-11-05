@@ -1,0 +1,20 @@
+{
+  "name": "SwitchHosts Native",
+  "slug": "switchhosts-native",
+  "identifier": "net.oldj.switchhosts.native",
+  "version": "5.0.3",
+  "copyright": "Copyright (c) 2026 SwitchHosts contributors. Licensed under Apache-2.0.",
+  "publisher": "SwitchHosts",
+  "icon": "resources/icon.png",
+  "main": ".",
+  "out": "build",
+  "linux": {
+    "webview": false,
+    "comment": "SwitchHosts hosts-file manager, drawn with the pure-Go MyGo native UI",
+    "categories": ["Utility", "Network"]
+  },
+  "windows": {
+    "displayName": "SwitchHosts Native",
+    "installDirName": "SwitchHostsNative"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "cases": [
+    {
+      "name": "first apply into an empty hosts file",
+      "previous": "",
+      "applies": ["127.0.0.1 example.test"],
+      "expected": "# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 example.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n"
+    },
+    {
+      "name": "reapply replaces the managed section and preserves the tail",
+      "previous": "127.0.0.1 localhost\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 old.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n10.0.0.1 tail.test\n",
+      "applies": ["127.0.0.1 new.test"],
+      "expected": "127.0.0.1 localhost\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 new.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n\n10.0.0.1 tail.test\n"
+    },
+    {
+      "name": "empty apply keeps an empty anchor when a tail exists",
+      "previous": "127.0.0.1 localhost\n# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 old.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n10.0.0.1 tail.test\n",
+      "applies": [""],
+      "expected": "127.0.0.1 localhost\n\n# --- SWITCHHOSTS_CONTENT_START ---\n\n# --- SWITCHHOSTS_CONTENT_END ---\n\n10.0.0.1 tail.test\n"
+    },
+    {
+      "name": "applying the same content twice is byte-identical",
+      "previous": "",
+      "applies": ["127.0.0.1 stable.test", "127.0.0.1 stable.test"],
+      "expected": "# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 stable.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n"
+    },
+    {
+      "name": "marker lines inside the payload are stripped",
+      "previous": "",
+      "applies": ["# --- SWITCHHOSTS_CONTENT_START ---\n127.0.0.1 inline.test\n# --- SWITCHHOSTS_CONTENT_END ---"],
+      "expected": "# --- SWITCHHOSTS_CONTENT_START ---\n\n127.0.0.1 inline.test\n\n# --- SWITCHHOSTS_CONTENT_END ---\n"
+    }
+  ]
+}

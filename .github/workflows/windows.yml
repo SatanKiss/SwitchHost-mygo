@@ -1,0 +1,346 @@
+# Adaptive Windows CI/CD for the pure-Go SwitchHosts native app.
+#
+# The workflow reads name / slug / version / out from mygo.json on every run,
+# then adapts itself to the event:
+#   - pull request  -> test, vet, build the portable .exe only (fast feedback)
+#   - push to master -> test, vet, build .exe + NSIS setup installer, upload artifacts
+#   - push tag v*    -> same, plus a GitHub Release with the binaries
+#   - manual dispatch -> choose targets, installer and release behaviour
+#
+# The build matrix is derived at runtime from the requested GOOS/GOARCH list,
+# so adding a target needs no workflow edit. The version is injected from
+# mygo.json through MYGO_LDFLAGS, so the binary never drifts from the config.
+
+name: Windows CI/CD
+
+on:
+  push:
+    branches: [master, main]
+    tags: ["v*"]
+    paths-ignore:
+      - "*.md"
+      - "LICENSE"
+      - ".gitignore"
+  pull_request:
+    branches: [master, main]
+    paths-ignore:
+      - "*.md"
+      - "LICENSE"
+      - ".gitignore"
+  workflow_dispatch:
+    inputs:
+      platforms:
+        description: "GOOS/GOARCH targets, comma separated (Windows only)"
+        required: false
+        default: "windows/amd64,windows/arm64"
+        type: string
+      installer:
+        description: "Build the NSIS setup installer"
+        required: false
+        default: true
+        type: boolean
+      release:
+        description: "Publish a GitHub Release (auto = only on version tags)"
+        required: false
+        default: auto
+        type: choice
+        options: [auto, always, never]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CGO_ENABLED: "0"
+  DEFAULT_PLATFORMS: "windows/amd64,windows/arm64"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Derive everything from the single source of truth: mygo.json.
+  # ---------------------------------------------------------------------------
+  meta:
+    name: Resolve build plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      version: ${{ steps.plan.outputs.version }}
+      slug: ${{ steps.plan.outputs.slug }}
+      name: ${{ steps.plan.outputs.name }}
+      out: ${{ steps.plan.outputs.out }}
+      matrix: ${{ steps.plan.outputs.matrix }}
+      installer: ${{ steps.plan.outputs.installer }}
+      release: ${{ steps.plan.outputs.release }}
+      tag: ${{ steps.plan.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Derive plan from mygo.json and the triggering event
+        id: plan
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_PLATFORMS: ${{ inputs.platforms }}
+          INPUT_INSTALLER: ${{ inputs.installer }}
+          INPUT_RELEASE: ${{ inputs.release }}
+        run: |
+          set -euo pipefail
+          version=$(jq -r '.version // empty' mygo.json)
+          slug=$(jq -r '.slug // empty' mygo.json)
+          name=$(jq -r '.name // empty' mygo.json)
+          out=$(jq -r '.out // "dist"' mygo.json)
+          if [[ -z "$version" || -z "$slug" || -z "$name" || -z "$out" ]]; then
+            echo "::error::mygo.json must define name, slug, version and out"
+            exit 1
+          fi
+
+          is_tag=false
+          if [[ "$EVENT" == "push" && "$REF" == refs/tags/* ]]; then
+            is_tag=true
+          fi
+
+          # A release tag must match the version in mygo.json, so no stale
+          # binaries are ever published under the wrong version number.
+          if $is_tag; then
+            want="v$version"
+            if [[ "$REF_NAME" != "$want" ]]; then
+              echo "::error::tag $REF_NAME does not match mygo.json version $version (expected $want)"
+              exit 1
+            fi
+          fi
+
+          tag="v$version"
+          if $is_tag; then
+            tag="$REF_NAME"
+          fi
+
+          release=false
+          case "${INPUT_RELEASE:-auto}" in
+            always) release=true ;;
+            never)  release=false ;;
+            *)      if $is_tag; then release=true; fi ;;
+          esac
+
+          # PRs only need the portable executable: skipping NSIS keeps the
+          # feedback loop short. Everything else gets the setup installer.
+          installer=true
+          if [[ "$EVENT" == "pull_request" ]]; then
+            installer=false
+          fi
+          if [[ "${INPUT_INSTALLER:-}" == "false" ]]; then
+            installer=false
+          fi
+
+          platforms="${INPUT_PLATFORMS:-$DEFAULT_PLATFORMS}"
+          matrix=$(PLATFORMS="$platforms" python3 -c '
+          import json, os
+          items = []
+          for p in (s.strip() for s in os.environ["PLATFORMS"].split(",")):
+            if not p: continue
+            goos, sep, arch = p.partition("/")
+            if not sep or goos != "windows" or not arch:
+              raise SystemExit("::error::invalid platform %r; expected windows/<arch>" % p)
+            items.append({"platform": p, "arch": arch, "dir": goos + "-" + arch})
+          if not items: raise SystemExit("::error::no platforms requested")
+          print(json.dumps(items, separators=(",", ":")))
+          ')
+
+          {
+            echo "version=$version"
+            echo "slug=$slug"
+            echo "name=$name"
+            echo "out=$out"
+            echo "installer=$installer"
+            echo "release=$release"
+            echo "tag=$tag"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "### Build plan" >> "$GITHUB_STEP_SUMMARY"
+          echo "- app: $name $version ($slug)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- targets: $platforms" >> "$GITHUB_STEP_SUMMARY"
+          echo "- NSIS installer: $installer" >> "$GITHUB_STEP_SUMMARY"
+          echo "- GitHub Release: $release ($tag)" >> "$GITHUB_STEP_SUMMARY"
+
+  # ---------------------------------------------------------------------------
+  # Continuous integration: tests, vet and formatting on the host platform.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Test & vet
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: go test
+        run: go test ./...
+      - name: go vet
+        run: go vet ./...
+      - name: gofmt
+        shell: bash
+        run: |
+          set -euo pipefail
+          unformatted=$(gofmt -l .)
+          if [[ -n "$unformatted" ]]; then
+            echo "::error::these files are not gofmt-clean:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+  # ---------------------------------------------------------------------------
+  # Continuous delivery: cross-compile Windows apps with the MyGo CLI pinned
+  # as a Go tool in go.mod. No cgo, so an Ubuntu runner builds Windows targets.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Package ${{ matrix.dir }}
+    needs: [meta, verify]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.meta.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install NSIS (Windows setup installer)
+        if: needs.meta.outputs.installer == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends nsis
+          command -v makensis
+
+      - name: Build Windows app with MyGo
+        shell: bash
+        env:
+          MYGO_LDFLAGS: "-X main.appVersion=${{ needs.meta.outputs.version }}"
+        run: |
+          set -euo pipefail
+          args=(-platform "${{ matrix.platform }}")
+          if [[ "${{ needs.meta.outputs.installer }}" != "true" ]]; then
+            args+=(-skip-installer)
+          fi
+          go tool mygo build "${args[@]}"
+
+      - name: Assemble downloadable assets
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+          SLUG: ${{ needs.meta.outputs.slug }}
+          OUT: ${{ needs.meta.outputs.out }}
+          ARCH: ${{ matrix.arch }}
+          TARGET: ${{ matrix.dir }}
+          INSTALLER: ${{ needs.meta.outputs.installer }}
+        run: |
+          set -euo pipefail
+          src="$OUT/$TARGET"
+          mkdir -p artifacts
+          exe=$(find "$src" -maxdepth 1 -name '*.exe' ! -name '*-setup-*' -print -quit)
+          if [[ -z "$exe" ]]; then
+            echo "::error::no executable found in $src"
+            exit 1
+          fi
+          python3 -c '
+          import sys
+          with open(sys.argv[1], "rb") as f:
+            magic = f.read(2)
+          if magic != b"MZ":
+            raise SystemExit("::error::%s is not a Windows PE executable" % sys.argv[1])
+          print("PE header OK:", sys.argv[1])
+          ' "$exe"
+
+          cp "$exe" "artifacts/$SLUG-$VERSION-windows-$ARCH.exe"
+          if [[ "$INSTALLER" == "true" ]]; then
+            setup=$(find "$src" -maxdepth 1 -name '*-setup-*.exe' -print -quit)
+            if [[ -z "$setup" ]]; then
+              echo "::error::NSIS installer missing in $src"
+              exit 1
+            fi
+            cp "$setup" "artifacts/$SLUG-setup-$VERSION-$ARCH.exe"
+          fi
+
+          dest="$(pwd)/artifacts/$SLUG-$VERSION-windows-$ARCH-portable.zip"
+          python3 -c '
+          import os, sys, zipfile
+          src, dest = sys.argv[1], sys.argv[2]
+          with zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED) as z:
+            for name in sorted(os.listdir(src)):
+              p = os.path.join(src, name)
+              if os.path.isfile(p) and "-setup-" not in name:
+                z.write(p, name)
+          ' "$src" "$dest"
+
+          (cd artifacts && sha256sum *.exe *.zip > "SHA256SUMS-$ARCH.txt")
+          ls -lh artifacts
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 14
+
+  # ---------------------------------------------------------------------------
+  # Publish: version tags get a release automatically; manual runs can force
+  # one. Re-running replaces assets instead of failing on an existing tag.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish GitHub Release
+    needs: [meta, build]
+    if: needs.meta.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: downloaded
+      - name: Flatten artifacts into release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          find downloaded -type f \( -name '*.exe' -o -name '*.zip' \) -exec cp {} release/ \;
+          mapfile -t sums < <(find downloaded -type f -name 'SHA256SUMS-*.txt' | sort)
+          if (( ${#sums[@]} == 0 )); then
+            echo "::error::no per-architecture checksums found in the artifacts"
+            exit 1
+          fi
+          cat "${sums[@]}" > release/SHA256SUMS.txt
+          ls -lh release
+      - name: Create or update the GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.meta.outputs.tag }}
+          VERSION: ${{ needs.meta.outputs.version }}
+          NAME: ${{ needs.meta.outputs.name }}
+          SHA: ${{ github.sha }}
+          IS_TAG: ${{ startsWith(github.ref, 'refs/tags/') }}
+        run: |
+          set -euo pipefail
+          title="$NAME $VERSION"
+          if gh release view "$TAG" --repo "$REPO" > /dev/null 2>&1; then
+            gh release upload "$TAG" release/* --clobber --repo "$REPO"
+            gh release edit "$TAG" --draft=false --repo "$REPO"
+            echo "Updated release $TAG"
+          elif [[ "$IS_TAG" == "true" ]]; then
+            gh release create "$TAG" --repo "$REPO" --title "$title" --generate-notes release/*
+          else
+            gh release create "$TAG" --repo "$REPO" --target "$SHA" \
+              --title "$title" --generate-notes release/*
+          fi

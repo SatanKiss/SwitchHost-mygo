@@ -31,3 +31,11 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# MyGo build output (mygo.json "out"), generated Windows resources and
+# release staging. Sources stay tracked; only produced binaries are ignored.
+/build/
+/dist/
+/artifacts/
+mygo_windows_*.syso
+mygo-update.key
